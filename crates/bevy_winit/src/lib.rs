@@ -18,6 +18,7 @@ use bevy_derive::Deref;
 use bevy_reflect::Reflect;
 use bevy_window::{ExitSystems, RawHandleWrapperHolder, WindowEvent};
 use core::cell::RefCell;
+use std::sync::mpsc::{self, Sender};
 use winit::{event_loop::EventLoop, window::WindowId};
 
 use bevy_a11y::AccessibilityRequested;
@@ -26,11 +27,9 @@ use bevy_ecs::prelude::*;
 use bevy_window::{CursorOptions, Window, WindowCreated};
 use system::{changed_cursor_options, changed_windows, check_keyboard_focus_lost, despawn_windows};
 pub use system::{create_monitors, create_windows};
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub use winit::platform::web::CustomCursorExtWebSys;
 pub use winit::{
+    cursor::{CustomCursor as WinitCustomCursor, CustomCursorSource},
     event_loop::EventLoopProxy,
-    window::{CustomCursor as WinitCustomCursor, CustomCursorSource},
 };
 pub use winit_config::*;
 pub use winit_monitors::*;
@@ -88,7 +87,10 @@ impl Plugin for WinitPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        let mut event_loop_builder = EventLoop::<WinitUserEvent>::with_user_event();
+        // winit 0.31 removed `EventLoop::with_user_event` and the generic `EventLoopProxy<T>`.
+        // User events are now delivered over a side channel, with the winit proxy used only
+        // to wake the event loop (see `EventLoopProxyWrapper` and `WinitUserEvent`).
+        let mut event_loop_builder = EventLoop::builder();
 
         // linux check is needed because x11 might be enabled on other platforms.
         #[cfg(all(target_os = "linux", feature = "x11"))]
@@ -127,12 +129,19 @@ impl Plugin for WinitPlugin {
             .build()
             .expect("Failed to build event loop");
 
+        // The side channel that carries `WinitUserEvent`s into the event loop. The winit
+        // `EventLoopProxy` is only used to wake the loop; the actual payload travels here.
+        let (user_event_sender, user_event_receiver) = mpsc::channel::<WinitUserEvent>();
+
         app.init_resource::<WinitMonitors>()
             .init_resource::<WinitSettings>()
             .insert_resource(DisplayHandleWrapper(event_loop.owned_display_handle()))
-            .insert_resource(EventLoopProxyWrapper(event_loop.create_proxy()))
+            .insert_resource(EventLoopProxyWrapper::new(
+                event_loop.create_proxy(),
+                user_event_sender,
+            ))
             .add_message::<RawWinitWindowEvent>()
-            .set_runner(|app| winit_runner(app, event_loop))
+            .set_runner(move |app| winit_runner(app, event_loop, user_event_receiver))
             .add_systems(
                 Last,
                 (
@@ -196,14 +205,45 @@ pub struct RawWinitWindowEvent {
     pub event: winit::event::WindowEvent,
 }
 
-/// A wrapper type around [`winit::event_loop::EventLoopProxy`] with the specific
-/// [`winit::event::Event::UserEvent`] used in the [`WinitPlugin`].
+/// A wrapper type around [`winit::event_loop::EventLoopProxy`] that can be used to send
+/// [`WinitUserEvent`]s into the [`WinitPlugin`]'s event loop.
 ///
-/// The `EventLoopProxy` can be used to request a redraw from outside bevy.
+/// winit 0.31 removed the generic `EventLoopProxy<T>`; user events are now delivered
+/// over a [`std::sync::mpsc`] channel, and the winit proxy is used purely to wake the
+/// event loop so it processes the channel.
+///
+/// The `EventLoopProxy` can also be used to request a redraw from outside bevy.
 ///
 /// Use `Res<EventLoopProxyWrapper>` to retrieve this resource.
-#[derive(Resource, Deref)]
-pub struct EventLoopProxyWrapper(EventLoopProxy<WinitUserEvent>);
+#[derive(Resource, Clone)]
+pub struct EventLoopProxyWrapper {
+    proxy: EventLoopProxy,
+    sender: Sender<WinitUserEvent>,
+}
+
+impl EventLoopProxyWrapper {
+    /// Creates a new wrapper from a winit proxy and the user-event channel sender.
+    pub(crate) fn new(proxy: EventLoopProxy, sender: Sender<WinitUserEvent>) -> Self {
+        Self { proxy, sender }
+    }
+
+    /// Sends a [`WinitUserEvent`] into the event loop and wakes it so the event is processed.
+    ///
+    /// Returns an error if the event loop has shut down.
+    pub fn send_event(&self, event: WinitUserEvent) -> Result<(), mpsc::SendError<WinitUserEvent>> {
+        // Place the payload on the channel *before* waking the loop, otherwise
+        // `proxy_wake_up` might run before the event is observable.
+        self.sender.send(event)?;
+        self.proxy.wake_up();
+        Ok(())
+    }
+
+    /// Returns the underlying winit [`EventLoopProxy`], which can be used to wake the
+    /// event loop (for example, to request a redraw).
+    pub fn proxy(&self) -> &EventLoopProxy {
+        &self.proxy
+    }
+}
 
 /// A wrapper around [`winit::event_loop::OwnedDisplayHandle`]
 ///

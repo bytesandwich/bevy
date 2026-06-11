@@ -39,7 +39,7 @@ use bevy_math::{IVec2, UVec2};
 #[cfg(target_os = "ios")]
 use winit::platform::ios::WindowExtIOS;
 #[cfg(target_arch = "wasm32")]
-use winit::platform::web::WindowExtWebSys;
+use winit::platform::web::WindowExtWeb;
 
 /// Creates new windows on the [`winit`] backend for each entity with a newly-added
 /// [`Window`] component.
@@ -47,7 +47,7 @@ use winit::platform::web::WindowExtWebSys;
 /// If any of these entities are missing required components, those will be added with their
 /// default values.
 pub fn create_windows(
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
     (
         mut commands,
         mut created_windows,
@@ -175,7 +175,7 @@ pub(crate) fn check_keyboard_focus_lost(
 
 /// Synchronize available monitors as reported by [`winit`] with [`Monitor`] entities in the world.
 pub fn create_monitors(
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
     (mut commands, mut monitors): SystemParamItem<CreateMonitorParams>,
 ) {
     let primary_monitor = event_loop.primary_monitor();
@@ -189,16 +189,24 @@ pub fn create_monitors(
             }
         }
 
-        let size = monitor.size();
-        let position = monitor.position();
+        // winit 0.31 changed monitor metadata: `size` is gone (use the current video
+        // mode), `position` is now fallible, `name` returns a `Cow`, and the refresh
+        // rate / bit depth are reported as `Option<NonZero*>`.
+        let current_video_mode = monitor.current_video_mode();
+        let size = current_video_mode
+            .map(|mode| mode.size())
+            .unwrap_or_default();
+        let position = monitor.position().unwrap_or_default();
 
         let entity = commands
             .spawn(Monitor {
-                name: monitor.name(),
+                name: monitor.name().map(|name| name.into_owned()),
                 physical_height: size.height,
                 physical_width: size.width,
                 physical_position: IVec2::new(position.x, position.y),
-                refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
+                refresh_rate_millihertz: current_video_mode
+                    .and_then(|mode| mode.refresh_rate_millihertz())
+                    .map(|rate| rate.get()),
                 scale_factor: monitor.scale_factor(),
                 video_modes: monitor
                     .video_modes()
@@ -206,8 +214,10 @@ pub fn create_monitors(
                         let size = v.size();
                         VideoMode {
                             physical_size: UVec2::new(size.width, size.height),
-                            bit_depth: v.bit_depth(),
-                            refresh_rate_millihertz: v.refresh_rate_millihertz(),
+                            bit_depth: v.bit_depth().map_or(0, |depth| depth.get()),
+                            refresh_rate_millihertz: v
+                                .refresh_rate_millihertz()
+                                .map_or(0, |rate| rate.get()),
                         }
                     })
                     .collect(),
@@ -242,7 +252,7 @@ pub(crate) fn despawn_windows(
     window_entities: Query<Entity, With<Window>>,
     mut closing_event_writer: MessageWriter<WindowClosing>,
     mut closed_event_writer: MessageWriter<WindowClosed>,
-    mut windows_to_drop: Local<Vec<WindowWrapper<winit::window::Window>>>,
+    mut windows_to_drop: Local<Vec<WindowWrapper<Box<dyn winit::window::Window>>>>,
     mut exit_event_reader: MessageReader<AppExit>,
     _non_send_marker: NonSendMarker,
 ) {
@@ -326,7 +336,7 @@ pub(crate) fn changed_windows(
             if window.mode != cache.mode {
                 let new_mode = match window.mode {
                     WindowMode::BorderlessFullscreen(monitor_selection) => {
-                        Some(Some(winit::window::Fullscreen::Borderless(select_monitor(
+                        Some(Some(winit::monitor::Fullscreen::Borderless(select_monitor(
                             &monitors,
                             winit_window.primary_monitor(),
                             winit_window.current_monitor(),
@@ -346,7 +356,10 @@ pub(crate) fn changed_windows(
 
                         if let Some(video_mode) = get_selected_videomode(monitor, &video_mode_selection)
                         {
-                            Some(Some(winit::window::Fullscreen::Exclusive(video_mode)))
+                            Some(Some(winit::monitor::Fullscreen::Exclusive(
+                                (*monitor).clone(),
+                                video_mode,
+                            )))
                         } else {
                             warn!(
                                 "Could not find valid fullscreen video mode for {:?} {:?}",
@@ -380,7 +393,7 @@ pub(crate) fn changed_windows(
                     };
 
                     if should_set {
-                        winit_window.set_outer_position(position);
+                        winit_window.set_outer_position(position.into());
                     }
                 }
 
@@ -423,18 +436,20 @@ pub(crate) fn changed_windows(
                 }
 
                 if physical_size != cached_physical_size
-                    && let Some(new_physical_size) = winit_window.request_inner_size(physical_size) {
-                        let event = react_to_resize(entity, &mut window, new_physical_size);
-                        window_resized.write(event.clone());
-                        window_event.write(WindowEvent::WindowResized(event));
-                    }
+                    && let Some(new_physical_size) =
+                        winit_window.request_surface_size(physical_size.into())
+                {
+                    let event = react_to_resize(entity, &mut window, new_physical_size);
+                    window_resized.write(event.clone());
+                    window_event.write(WindowEvent::WindowResized(event));
+                }
             }
 
             if window.physical_cursor_position() != cache.physical_cursor_position()
                 && let Some(physical_position) = window.physical_cursor_position() {
                     let position = PhysicalPosition::new(physical_position.x, physical_position.y);
 
-                    if let Err(err) = winit_window.set_cursor_position(position) {
+                    if let Err(err) = winit_window.set_cursor_position(position.into()) {
                         error!("could not set cursor position: {}", err);
                     }
                 }
@@ -466,10 +481,10 @@ pub(crate) fn changed_windows(
                     height: constraints.max_height,
                 };
 
-                winit_window.set_min_inner_size(Some(min_inner_size));
-                winit_window.set_max_inner_size(
+                winit_window.set_min_surface_size(Some(min_inner_size.into()));
+                winit_window.set_max_surface_size(
                     if constraints.max_width.is_finite() && constraints.max_height.is_finite() {
-                        Some(max_inner_size)
+                        Some(max_inner_size.into())
                     } else {
                         None
                     },
@@ -536,15 +551,49 @@ pub(crate) fn changed_windows(
                 );
             }
 
-            if window.ime_enabled != cache.ime_enabled {
-                winit_window.set_ime_allowed(window.ime_enabled);
-            }
+            // winit 0.31 replaced `set_ime_allowed` / `set_ime_cursor_area` with the
+            // unified `request_ime_update` API. Enabling IME carries an initial cursor
+            // area; subsequent cursor-area changes are sent as `Update` requests, which
+            // only take effect while IME is enabled.
+            {
+                use winit::window::{
+                    ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData,
+                };
 
-            if window.ime_position != cache.ime_position {
-                winit_window.set_ime_cursor_area(
-                    LogicalPosition::new(window.ime_position.x, window.ime_position.y),
-                    PhysicalSize::new(10, 10),
+                let cursor_area = (
+                    LogicalPosition::new(window.ime_position.x, window.ime_position.y).into(),
+                    PhysicalSize::new(10, 10).into(),
                 );
+
+                if window.ime_enabled != cache.ime_enabled {
+                    let request = if window.ime_enabled {
+                        let caps = ImeCapabilities::new().with_cursor_area();
+                        let data = ImeRequestData::default()
+                            .with_cursor_area(cursor_area.0, cursor_area.1);
+                        match ImeEnableRequest::new(caps, data) {
+                            Some(enable) => Some(ImeRequest::Enable(enable)),
+                            None => {
+                                warn!("Could not build IME enable request");
+                                None
+                            }
+                        }
+                    } else {
+                        Some(ImeRequest::Disable)
+                    };
+                    if let Some(request) = request
+                        && let Err(err) = winit_window.request_ime_update(request)
+                    {
+                        warn!("Could not update IME state: {err:?}");
+                    }
+                } else if window.ime_enabled && window.ime_position != cache.ime_position {
+                    let data = ImeRequestData::default()
+                        .with_cursor_area(cursor_area.0, cursor_area.1);
+                    if let Err(err) =
+                        winit_window.request_ime_update(ImeRequest::Update(data))
+                    {
+                        warn!("Could not update IME cursor area: {err:?}");
+                    }
+                }
             }
 
             if window.window_theme != cache.window_theme {
@@ -622,7 +671,7 @@ pub(crate) fn changed_cursor_options(
             };
             // Don't check the cache for the grab mode. It can change through external means, leaving the cache outdated.
             if let Err(err) =
-                crate::winit_windows::attempt_grab(winit_window, cursor_options.grab_mode)
+                crate::winit_windows::attempt_grab(&***winit_window, cursor_options.grab_mode)
             {
                 warn!(
                     "Could not set cursor grab mode for window {}: {}",

@@ -6,6 +6,7 @@ use bevy_input::{
     gestures::*,
     keyboard::{KeyboardFocusLost, KeyboardInput},
     mouse::{MouseButtonInput, MouseMotion, MouseWheel},
+    pointer::PointerKind,
     touch::TouchInput,
 };
 use bevy_math::{IVec2, Vec2};
@@ -200,10 +201,12 @@ pub struct CursorMoved {
     //  transformed by the OS to implement effects such as cursor acceleration, it should
     // not be used to implement non-cursor-like interactions such as 3D camera control.
     pub delta: Option<Vec2>,
+    /// The kind of device that produced this event.
+    pub kind: PointerKind,
 }
 
 /// An event that is sent whenever the user's cursor enters a window.
-#[derive(Message, Debug, Clone, PartialEq, Eq)]
+#[derive(Message, Debug, Clone, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -217,10 +220,12 @@ pub struct CursorMoved {
 pub struct CursorEntered {
     /// Window that the cursor entered.
     pub window: Entity,
+    /// The kind of device that produced this event.
+    pub kind: PointerKind,
 }
 
 /// An event that is sent whenever the user's cursor leaves a window.
-#[derive(Message, Debug, Clone, PartialEq, Eq)]
+#[derive(Message, Debug, Clone, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -234,6 +239,8 @@ pub struct CursorEntered {
 pub struct CursorLeft {
     /// Window that the cursor left.
     pub window: Entity,
+    /// The kind of device that produced this event.
+    pub kind: PointerKind,
 }
 
 /// An Input Method Editor event.

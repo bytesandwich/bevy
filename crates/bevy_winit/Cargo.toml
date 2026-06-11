@@ -62,13 +62,11 @@ wgpu-types = { version = "29.0.3", optional = true }
 bytemuck = { version = "1.5", optional = true }
 
 # other
-# feature rwh_06 refers to window_raw_handle@v0.6
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-accesskit_winit = { version = "0.32", default-features = false, features = [
-  "rwh_06",
-] }
+winit = { path = "/Users/jack/src/winit/winit", default-features = false }
+accesskit_winit = { path = "/Users/jack/src/accesskit/platforms/winit", default-features = false }
 approx = { version = "0.5", default-features = false }
-accesskit = "0.24"
+cfg-if = "1.0"
+accesskit = { path = "/Users/jack/src/accesskit/common" }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "android")'.dependencies]

@@ -3,6 +3,9 @@ use bevy_ecs::entity::Entity;
 use bevy_input::{
     keyboard::{KeyCode, KeyboardInput, NativeKeyCode},
     mouse::MouseButton,
+    pointer::{
+        Force, PointerKind, TabletToolAngle, TabletToolData, TabletToolKind, TabletToolTilt,
+    },
     touch::{ForceTouch, TouchInput, TouchPhase},
     ButtonState,
 };
@@ -23,7 +26,12 @@ pub fn convert_keyboard_input(
         state: convert_element_state(keyboard_input.state),
         key_code: convert_physical_key_code(keyboard_input.physical_key),
         logical_key: convert_logical_key(&keyboard_input.logical_key),
-        text: keyboard_input.text.clone(),
+        // winit-core and bevy_input depend on different `smol_str` versions, so the
+        // string must be rebridged through `&str`.
+        text: keyboard_input
+            .text
+            .as_ref()
+            .map(|text| text.as_str().into()),
         repeat: keyboard_input.repeat,
         window,
     }
@@ -38,6 +46,9 @@ pub fn convert_element_state(element_state: winit::event::ElementState) -> Butto
 }
 
 /// Converts a [`winit::event::MouseButton`] to a Bevy [`MouseButton`]
+///
+/// winit 0.31 replaced the open-ended `Other(u16)` variant with explicit
+/// `Button6`..=`Button32` variants; those map onto Bevy's `Other` variant.
 pub fn convert_mouse_button(mouse_button: winit::event::MouseButton) -> MouseButton {
     match mouse_button {
         winit::event::MouseButton::Left => MouseButton::Left,
@@ -45,7 +56,28 @@ pub fn convert_mouse_button(mouse_button: winit::event::MouseButton) -> MouseBut
         winit::event::MouseButton::Middle => MouseButton::Middle,
         winit::event::MouseButton::Back => MouseButton::Back,
         winit::event::MouseButton::Forward => MouseButton::Forward,
-        winit::event::MouseButton::Other(val) => MouseButton::Other(val),
+        other => MouseButton::Other(other as u16),
+    }
+}
+
+/// Builds a Bevy [`TouchInput`] from the components winit 0.31 delivers via pointer events.
+///
+/// In winit 0.31 there is no longer a dedicated `Touch` event; touches arrive as
+/// `WindowEvent::Pointer*` events carrying a [`winit::event::FingerId`]. This helper
+/// assembles the equivalent Bevy event from the decomposed data.
+pub fn convert_touch_input(
+    phase: TouchPhase,
+    location: winit::dpi::LogicalPosition<f64>,
+    force: Option<winit::event::Force>,
+    finger_id: winit::event::FingerId,
+    window_entity: Entity,
+) -> TouchInput {
+    TouchInput {
+        phase,
+        position: Vec2::new(location.x as f32, location.y as f32),
+        window: window_entity,
+        force: force.map(convert_winit_force_touch),
+        id: finger_id.into_raw() as u64,
     }
 }
 
@@ -59,29 +91,114 @@ pub fn convert_touch_phase(phase: winit::event::TouchPhase) -> TouchPhase {
     }
 }
 
-/// Converts a [`winit::event::Touch`], [`winit::dpi::LogicalPosition<f64>`] and window [`Entity`] to a Bevy [`TouchInput`]
-pub fn convert_touch_input(
-    touch_input: winit::event::Touch,
-    location: winit::dpi::LogicalPosition<f64>,
-    window_entity: Entity,
-) -> TouchInput {
-    TouchInput {
-        phase: convert_touch_phase(touch_input.phase),
-        position: Vec2::new(location.x as f32, location.y as f32),
-        window: window_entity,
-        force: touch_input.force.map(|f| match f {
-            winit::event::Force::Calibrated {
-                force,
-                max_possible_force,
-                altitude_angle,
-            } => ForceTouch::Calibrated {
-                force,
-                max_possible_force,
-                altitude_angle,
-            },
-            winit::event::Force::Normalized(x) => ForceTouch::Normalized(x),
+/// Converts a [`winit::event::Force`] to a Bevy [`ForceTouch`].
+///
+/// winit 0.31 no longer reports `altitude_angle` directly on [`winit::event::Force`];
+/// the perpendicular-force calculation now lives on the tablet tool's angle data, so
+/// the calibrated variant maps with `altitude_angle: None`.
+fn convert_winit_force_touch(force: winit::event::Force) -> ForceTouch {
+    match force {
+        winit::event::Force::Calibrated {
+            force,
+            max_possible_force,
+        } => ForceTouch::Calibrated {
+            force,
+            max_possible_force,
+            altitude_angle: None,
+        },
+        winit::event::Force::Normalized(x) => ForceTouch::Normalized(x),
+    }
+}
+
+/// Converts a [`winit::event::Force`] to a Bevy [`Force`].
+pub fn convert_force(force: winit::event::Force) -> Force {
+    match force {
+        winit::event::Force::Calibrated {
+            force,
+            max_possible_force,
+        } => Force::Calibrated {
+            force,
+            max_possible_force,
+        },
+        winit::event::Force::Normalized(x) => Force::Normalized(x),
+    }
+}
+
+/// Converts a [`winit::event::TabletToolKind`] to a Bevy [`TabletToolKind`].
+pub fn convert_tool_kind(kind: winit::event::TabletToolKind) -> TabletToolKind {
+    match kind {
+        winit::event::TabletToolKind::Eraser => TabletToolKind::Eraser,
+        winit::event::TabletToolKind::Brush => TabletToolKind::Brush,
+        winit::event::TabletToolKind::Pencil => TabletToolKind::Pencil,
+        winit::event::TabletToolKind::Airbrush => TabletToolKind::Airbrush,
+        winit::event::TabletToolKind::Finger => TabletToolKind::Finger,
+        winit::event::TabletToolKind::Mouse => TabletToolKind::Mouse,
+        winit::event::TabletToolKind::Lens => TabletToolKind::Lens,
+        // `Pen` and any future variant (the enum is `#[non_exhaustive]`) map to `Pen`.
+        _ => TabletToolKind::Pen,
+    }
+}
+
+/// Converts a [`winit::event::TabletToolData`] to a Bevy [`TabletToolData`].
+pub fn convert_tool_data(data: &winit::event::TabletToolData) -> TabletToolData {
+    TabletToolData {
+        force: data.force.map(convert_force),
+        tangential_force: data.tangential_force,
+        twist: data.twist,
+        tilt: data.tilt.map(|t| TabletToolTilt { x: t.x, y: t.y }),
+        angle: data.angle.map(|a| TabletToolAngle {
+            altitude: a.altitude,
+            azimuth: a.azimuth,
         }),
-        id: touch_input.id,
+    }
+}
+
+/// Converts a [`winit::event::PointerSource`] to a Bevy [`PointerKind`].
+pub fn convert_pointer_source(source: &winit::event::PointerSource) -> PointerKind {
+    match source {
+        winit::event::PointerSource::Touch { .. } => PointerKind::Touch,
+        winit::event::PointerSource::TabletTool { kind, data } => PointerKind::Tablet {
+            tool: convert_tool_kind(*kind),
+            data: convert_tool_data(data),
+        },
+        // `Mouse`, `Unknown`, and any future variant (the enum is `#[non_exhaustive]`)
+        // all map to `Mouse`.
+        _ => PointerKind::Mouse,
+    }
+}
+
+/// Converts a [`winit::event::ButtonSource`] to a Bevy [`PointerKind`].
+pub fn convert_button_source(source: &winit::event::ButtonSource) -> PointerKind {
+    match source {
+        winit::event::ButtonSource::Touch { .. } => PointerKind::Touch,
+        winit::event::ButtonSource::TabletTool { kind, data, .. } => PointerKind::Tablet {
+            tool: convert_tool_kind(*kind),
+            data: convert_tool_data(data),
+        },
+        // `Mouse(_)`, `Unknown`, and any future variant (the enum is `#[non_exhaustive]`)
+        // all map to `Mouse`.
+        _ => PointerKind::Mouse,
+    }
+}
+
+/// Converts a [`winit::event::PointerKind`] (carried by enter/leave events, which have no
+/// contact data) to a Bevy [`PointerKind`].
+pub fn convert_pointer_kind(kind: winit::event::PointerKind) -> PointerKind {
+    match kind {
+        winit::event::PointerKind::Touch(_) => PointerKind::Touch,
+        winit::event::PointerKind::TabletTool(tool) => PointerKind::Tablet {
+            tool: convert_tool_kind(tool),
+            // Enter/leave events report no pressure, tilt, or orientation data.
+            data: TabletToolData {
+                force: None,
+                tangential_force: None,
+                twist: None,
+                tilt: None,
+                angle: None,
+            },
+        },
+        // `Mouse` and any future variant (the enum is `#[non_exhaustive]`) map to `Mouse`.
+        _ => PointerKind::Mouse,
     }
 }
 
@@ -90,7 +207,11 @@ pub fn convert_physical_native_key_code(
     native_key_code: winit::keyboard::NativeKeyCode,
 ) -> NativeKeyCode {
     match native_key_code {
-        winit::keyboard::NativeKeyCode::Unidentified => NativeKeyCode::Unidentified,
+        // winit 0.31's OpenHarmony native key code has no Bevy equivalent; join it
+        // with `Unidentified`.
+        winit::keyboard::NativeKeyCode::Unidentified | winit::keyboard::NativeKeyCode::Ohos(_) => {
+            NativeKeyCode::Unidentified
+        }
         winit::keyboard::NativeKeyCode::Android(scan_code) => NativeKeyCode::Android(scan_code),
         winit::keyboard::NativeKeyCode::MacOS(scan_code) => NativeKeyCode::MacOS(scan_code),
         winit::keyboard::NativeKeyCode::Windows(scan_code) => NativeKeyCode::Windows(scan_code),
@@ -162,8 +283,9 @@ pub fn convert_physical_key_code(virtual_key_code: winit::keyboard::PhysicalKey)
             winit::keyboard::KeyCode::ControlLeft => KeyCode::ControlLeft,
             winit::keyboard::KeyCode::ControlRight => KeyCode::ControlRight,
             winit::keyboard::KeyCode::Enter => KeyCode::Enter,
-            winit::keyboard::KeyCode::SuperLeft => KeyCode::SuperLeft,
-            winit::keyboard::KeyCode::SuperRight => KeyCode::SuperRight,
+            // winit 0.31 renamed the physical "Super"/OS keys to `MetaLeft`/`MetaRight`.
+            winit::keyboard::KeyCode::MetaLeft => KeyCode::SuperLeft,
+            winit::keyboard::KeyCode::MetaRight => KeyCode::SuperRight,
             winit::keyboard::KeyCode::ShiftLeft => KeyCode::ShiftLeft,
             winit::keyboard::KeyCode::ShiftRight => KeyCode::ShiftRight,
             winit::keyboard::KeyCode::Space => KeyCode::Space,
@@ -246,8 +368,20 @@ pub fn convert_physical_key_code(virtual_key_code: winit::keyboard::PhysicalKey)
             winit::keyboard::KeyCode::AudioVolumeMute => KeyCode::AudioVolumeMute,
             winit::keyboard::KeyCode::AudioVolumeUp => KeyCode::AudioVolumeUp,
             winit::keyboard::KeyCode::WakeUp => KeyCode::WakeUp,
-            winit::keyboard::KeyCode::Meta => KeyCode::Meta,
+            // winit 0.31's keyboard codes come from `keyboard-types`, which has no
+            // standalone physical `Meta` code (only `MetaLeft`/`MetaRight`).
+            //
+            // `Hyper`/`Turbo` are deprecated upstream (superseded by `Meta`) but are
+            // still emitted as physical key codes.
+            #[expect(
+                deprecated,
+                reason = "deprecated upstream but still emitted as physical key codes"
+            )]
             winit::keyboard::KeyCode::Hyper => KeyCode::Hyper,
+            #[expect(
+                deprecated,
+                reason = "deprecated upstream but still emitted as physical key codes"
+            )]
             winit::keyboard::KeyCode::Turbo => KeyCode::Turbo,
             winit::keyboard::KeyCode::Abort => KeyCode::Abort,
             winit::keyboard::KeyCode::Resume => KeyCode::Resume,
@@ -306,7 +440,9 @@ pub fn convert_physical_key_code(virtual_key_code: winit::keyboard::PhysicalKey)
 ///Converts a [`winit::keyboard::Key`] to a Bevy [`bevy_input::keyboard::Key`]
 pub fn convert_logical_key(logical_key_code: &Key) -> bevy_input::keyboard::Key {
     match logical_key_code {
-        Key::Character(s) => bevy_input::keyboard::Key::Character(s.clone()),
+        // winit-core and bevy_input depend on different `smol_str` versions; rebridge
+        // through `&str`.
+        Key::Character(s) => bevy_input::keyboard::Key::Character(s.as_str().into()),
         Key::Unidentified(nk) => bevy_input::keyboard::Key::Unidentified(convert_native_key(nk)),
         Key::Dead(c) => bevy_input::keyboard::Key::Dead(c.to_owned()),
         Key::Named(NamedKey::Alt) => bevy_input::keyboard::Key::Alt,
@@ -321,11 +457,16 @@ pub fn convert_logical_key(logical_key_code: &Key) -> bevy_input::keyboard::Key 
         Key::Named(NamedKey::Symbol) => bevy_input::keyboard::Key::Symbol,
         Key::Named(NamedKey::SymbolLock) => bevy_input::keyboard::Key::SymbolLock,
         Key::Named(NamedKey::Meta) => bevy_input::keyboard::Key::Meta,
+        // `Hyper`/`Super` are deprecated in `keyboard-types` (superseded by `Meta`) but
+        // are still produced as named keys.
+        #[expect(deprecated, reason = "still emitted as named keys by `keyboard-types`")]
         Key::Named(NamedKey::Hyper) => bevy_input::keyboard::Key::Hyper,
+        #[expect(deprecated, reason = "still emitted as named keys by `keyboard-types`")]
         Key::Named(NamedKey::Super) => bevy_input::keyboard::Key::Super,
         Key::Named(NamedKey::Enter) => bevy_input::keyboard::Key::Enter,
         Key::Named(NamedKey::Tab) => bevy_input::keyboard::Key::Tab,
-        Key::Named(NamedKey::Space) => bevy_input::keyboard::Key::Space,
+        // winit 0.31: "Space" is intentionally not a named key; it arrives as
+        // `Key::Character(" ")` and is handled by the `Character` arm above.
         Key::Named(NamedKey::ArrowDown) => bevy_input::keyboard::Key::ArrowDown,
         Key::Named(NamedKey::ArrowLeft) => bevy_input::keyboard::Key::ArrowLeft,
         Key::Named(NamedKey::ArrowRight) => bevy_input::keyboard::Key::ArrowRight,
@@ -638,52 +779,57 @@ pub fn convert_logical_key(logical_key_code: &Key) -> bevy_input::keyboard::Key 
 ///Converts a [`winit::keyboard::NativeKey`] to a Bevy [`NativeKey`](bevy_input::keyboard::NativeKey)
 pub fn convert_native_key(native_key: &NativeKey) -> bevy_input::keyboard::NativeKey {
     match native_key {
-        NativeKey::Unidentified => bevy_input::keyboard::NativeKey::Unidentified,
+        // winit 0.31's OpenHarmony native key has no Bevy equivalent; join it with `Unidentified`.
+        NativeKey::Unidentified | NativeKey::Ohos(_) => {
+            bevy_input::keyboard::NativeKey::Unidentified
+        }
         NativeKey::Android(v) => bevy_input::keyboard::NativeKey::Android(*v),
         NativeKey::MacOS(v) => bevy_input::keyboard::NativeKey::MacOS(*v),
         NativeKey::Windows(v) => bevy_input::keyboard::NativeKey::Windows(*v),
         NativeKey::Xkb(v) => bevy_input::keyboard::NativeKey::Xkb(*v),
-        NativeKey::Web(v) => bevy_input::keyboard::NativeKey::Web(v.clone()),
+        // winit-core and bevy_input depend on different `smol_str` versions; rebridge
+        // through `&str`.
+        NativeKey::Web(v) => bevy_input::keyboard::NativeKey::Web(v.as_str().into()),
     }
 }
 
-/// Converts a Bevy [`SystemCursorIcon`] to a [`winit::window::CursorIcon`].
-pub fn convert_system_cursor_icon(cursor_icon: SystemCursorIcon) -> winit::window::CursorIcon {
+/// Converts a Bevy [`SystemCursorIcon`] to a [`winit::cursor::CursorIcon`].
+pub fn convert_system_cursor_icon(cursor_icon: SystemCursorIcon) -> winit::cursor::CursorIcon {
     match cursor_icon {
-        SystemCursorIcon::Crosshair => winit::window::CursorIcon::Crosshair,
-        SystemCursorIcon::Pointer => winit::window::CursorIcon::Pointer,
-        SystemCursorIcon::Move => winit::window::CursorIcon::Move,
-        SystemCursorIcon::Text => winit::window::CursorIcon::Text,
-        SystemCursorIcon::Wait => winit::window::CursorIcon::Wait,
-        SystemCursorIcon::Help => winit::window::CursorIcon::Help,
-        SystemCursorIcon::Progress => winit::window::CursorIcon::Progress,
-        SystemCursorIcon::NotAllowed => winit::window::CursorIcon::NotAllowed,
-        SystemCursorIcon::ContextMenu => winit::window::CursorIcon::ContextMenu,
-        SystemCursorIcon::Cell => winit::window::CursorIcon::Cell,
-        SystemCursorIcon::VerticalText => winit::window::CursorIcon::VerticalText,
-        SystemCursorIcon::Alias => winit::window::CursorIcon::Alias,
-        SystemCursorIcon::Copy => winit::window::CursorIcon::Copy,
-        SystemCursorIcon::NoDrop => winit::window::CursorIcon::NoDrop,
-        SystemCursorIcon::Grab => winit::window::CursorIcon::Grab,
-        SystemCursorIcon::Grabbing => winit::window::CursorIcon::Grabbing,
-        SystemCursorIcon::AllScroll => winit::window::CursorIcon::AllScroll,
-        SystemCursorIcon::ZoomIn => winit::window::CursorIcon::ZoomIn,
-        SystemCursorIcon::ZoomOut => winit::window::CursorIcon::ZoomOut,
-        SystemCursorIcon::EResize => winit::window::CursorIcon::EResize,
-        SystemCursorIcon::NResize => winit::window::CursorIcon::NResize,
-        SystemCursorIcon::NeResize => winit::window::CursorIcon::NeResize,
-        SystemCursorIcon::NwResize => winit::window::CursorIcon::NwResize,
-        SystemCursorIcon::SResize => winit::window::CursorIcon::SResize,
-        SystemCursorIcon::SeResize => winit::window::CursorIcon::SeResize,
-        SystemCursorIcon::SwResize => winit::window::CursorIcon::SwResize,
-        SystemCursorIcon::WResize => winit::window::CursorIcon::WResize,
-        SystemCursorIcon::EwResize => winit::window::CursorIcon::EwResize,
-        SystemCursorIcon::NsResize => winit::window::CursorIcon::NsResize,
-        SystemCursorIcon::NeswResize => winit::window::CursorIcon::NeswResize,
-        SystemCursorIcon::NwseResize => winit::window::CursorIcon::NwseResize,
-        SystemCursorIcon::ColResize => winit::window::CursorIcon::ColResize,
-        SystemCursorIcon::RowResize => winit::window::CursorIcon::RowResize,
-        _ => winit::window::CursorIcon::Default,
+        SystemCursorIcon::Crosshair => winit::cursor::CursorIcon::Crosshair,
+        SystemCursorIcon::Pointer => winit::cursor::CursorIcon::Pointer,
+        SystemCursorIcon::Move => winit::cursor::CursorIcon::Move,
+        SystemCursorIcon::Text => winit::cursor::CursorIcon::Text,
+        SystemCursorIcon::Wait => winit::cursor::CursorIcon::Wait,
+        SystemCursorIcon::Help => winit::cursor::CursorIcon::Help,
+        SystemCursorIcon::Progress => winit::cursor::CursorIcon::Progress,
+        SystemCursorIcon::NotAllowed => winit::cursor::CursorIcon::NotAllowed,
+        SystemCursorIcon::ContextMenu => winit::cursor::CursorIcon::ContextMenu,
+        SystemCursorIcon::Cell => winit::cursor::CursorIcon::Cell,
+        SystemCursorIcon::VerticalText => winit::cursor::CursorIcon::VerticalText,
+        SystemCursorIcon::Alias => winit::cursor::CursorIcon::Alias,
+        SystemCursorIcon::Copy => winit::cursor::CursorIcon::Copy,
+        SystemCursorIcon::NoDrop => winit::cursor::CursorIcon::NoDrop,
+        SystemCursorIcon::Grab => winit::cursor::CursorIcon::Grab,
+        SystemCursorIcon::Grabbing => winit::cursor::CursorIcon::Grabbing,
+        SystemCursorIcon::AllScroll => winit::cursor::CursorIcon::AllScroll,
+        SystemCursorIcon::ZoomIn => winit::cursor::CursorIcon::ZoomIn,
+        SystemCursorIcon::ZoomOut => winit::cursor::CursorIcon::ZoomOut,
+        SystemCursorIcon::EResize => winit::cursor::CursorIcon::EResize,
+        SystemCursorIcon::NResize => winit::cursor::CursorIcon::NResize,
+        SystemCursorIcon::NeResize => winit::cursor::CursorIcon::NeResize,
+        SystemCursorIcon::NwResize => winit::cursor::CursorIcon::NwResize,
+        SystemCursorIcon::SResize => winit::cursor::CursorIcon::SResize,
+        SystemCursorIcon::SeResize => winit::cursor::CursorIcon::SeResize,
+        SystemCursorIcon::SwResize => winit::cursor::CursorIcon::SwResize,
+        SystemCursorIcon::WResize => winit::cursor::CursorIcon::WResize,
+        SystemCursorIcon::EwResize => winit::cursor::CursorIcon::EwResize,
+        SystemCursorIcon::NsResize => winit::cursor::CursorIcon::NsResize,
+        SystemCursorIcon::NeswResize => winit::cursor::CursorIcon::NeswResize,
+        SystemCursorIcon::NwseResize => winit::cursor::CursorIcon::NwseResize,
+        SystemCursorIcon::ColResize => winit::cursor::CursorIcon::ColResize,
+        SystemCursorIcon::RowResize => winit::cursor::CursorIcon::RowResize,
+        _ => winit::cursor::CursorIcon::Default,
     }
 }
 

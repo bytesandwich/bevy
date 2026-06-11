@@ -11,14 +11,17 @@ use bevy_ecs::{
 use bevy_input::{
     gestures::*,
     mouse::{MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel},
+    touch::TouchPhase as BevyTouchPhase,
 };
 use bevy_log::{trace, warn};
 use bevy_math::{ivec2, DVec2, Vec2};
 use bevy_platform::time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_tasks::tick_global_task_pools_on_main_thread;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 #[cfg(target_arch = "wasm32")]
-use winit::platform::web::EventLoopExtWebSys;
+use winit::platform::web::EventLoopExtWeb;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -92,10 +95,20 @@ pub(crate) struct WinitAppRunnerState {
     >,
     /// time at which next tick is scheduled to run when `update_mode` is [`UpdateMode::Reactive`]
     scheduled_tick_start: Option<Instant>,
+    /// Receiver for [`WinitUserEvent`]s sent through the [`EventLoopProxyWrapper`].
+    ///
+    /// winit 0.31 removed the generic `EventLoopProxy<T>`, so user events arrive over
+    /// this side channel and are drained in [`ApplicationHandler::proxy_wake_up`].
+    user_event_receiver: Receiver<WinitUserEvent>,
+    /// Shared slot used to communicate the app-exit code back to [`winit_runner`].
+    ///
+    /// winit 0.31 removed the `exiting` callback and takes the handler by value, so the
+    /// exit code can no longer be read off the handler after `run_app` returns.
+    app_exit_slot: Option<Arc<Mutex<Option<AppExit>>>>,
 }
 
 impl WinitAppRunnerState {
-    fn new(mut app: App) -> Self {
+    fn new(mut app: App, user_event_receiver: Receiver<WinitUserEvent>) -> Self {
         let windows_system_state: SystemState<
             Query<(&mut Window, &mut CachedWindow, &mut WinitWindowPressedKeys)>,
         > = SystemState::new(app.world_mut());
@@ -118,6 +131,8 @@ impl WinitAppRunnerState {
             raw_winit_events: Vec::new(),
             windows_system_state,
             scheduled_tick_start: None,
+            user_event_receiver,
+            app_exit_slot: None,
         }
     }
 
@@ -136,8 +151,8 @@ impl WinitAppRunnerState {
     }
 }
 
-impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+impl ApplicationHandler for WinitAppRunnerState {
+    fn new_events(&mut self, event_loop: &dyn ActiveEventLoop, cause: StartCause) {
         if event_loop.exiting() {
             return;
         }
@@ -170,36 +185,63 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
         };
     }
 
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn resumed(&mut self, _event_loop: &dyn ActiveEventLoop) {
         // Mark the state as `WillResume`. This will let the schedule run one extra time
-        // when actually resuming the app
+        // when actually resuming the app.
+        //
+        // winit 0.31 splits the old `resumed` semantics: surface creation now belongs in
+        // `can_create_surfaces`. On platforms with a real foreground/background lifecycle
+        // (iOS, Web, Android) `resumed` is still emitted when the app returns to the
+        // foreground, so the resume transition is also handled here.
         self.lifecycle = AppLifecycle::WillResume;
+    }
 
-        // Create the initial window if needed
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        // winit 0.31 introduced `can_create_surfaces` as the point at which windows/render
+        // surfaces may be created. It is always emitted after `StartCause::Init`, taking over
+        // the window-creation responsibility that `resumed` had in winit 0.30.
+        //
+        // In winit 0.30, `resumed` was also the startup hook and is where the runner
+        // transitioned the lifecycle out of `Idle`. winit 0.31 does *not* emit `resumed`
+        // at startup on desktop platforms (e.g. macOS only dispatches `new_events(Init)`
+        // followed by `can_create_surfaces`), so the lifecycle transition must happen here
+        // as well. Without this the lifecycle would stay `Idle`, `should_update` would
+        // always return `false` (`AppLifecycle::is_active()` is false for `Idle`), and the
+        // app would never update while still requesting a redraw every loop iteration —
+        // a runaway redraw loop.
+        if !self.lifecycle.is_active() {
+            self.lifecycle = AppLifecycle::WillResume;
+        }
+
         let mut create_window = SystemState::<CreateWindowParams>::from_world(self.world_mut());
         create_windows(event_loop, create_window.get_mut(self.world_mut()).unwrap());
         create_window.apply(self.world_mut());
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WinitUserEvent) {
+    fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        // winit 0.31 replaced the typed `user_event` callback with `proxy_wake_up`; the
+        // actual `WinitUserEvent` payloads are drained from the side channel here. Wake-ups
+        // may be coalesced, so all pending events are processed in one pass.
         self.user_event_received = true;
 
-        match event {
-            WinitUserEvent::WakeUp => {
-                self.redraw_requested = true;
-            }
-            WinitUserEvent::WindowAdded => {
-                let mut create_window =
-                    SystemState::<CreateWindowParams>::from_world(self.world_mut());
-                create_windows(event_loop, create_window.get_mut(self.world_mut()).unwrap());
-                create_window.apply(self.world_mut());
+        while let Ok(event) = self.user_event_receiver.try_recv() {
+            match event {
+                WinitUserEvent::WakeUp => {
+                    self.redraw_requested = true;
+                }
+                WinitUserEvent::WindowAdded => {
+                    let mut create_window =
+                        SystemState::<CreateWindowParams>::from_world(self.world_mut());
+                    create_windows(event_loop, create_window.get_mut(self.world_mut()).unwrap());
+                    create_window.apply(self.world_mut());
+                }
             }
         }
     }
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        _event_loop: &dyn ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -241,11 +283,12 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                 if let Some(adapter) = access_kit_adapters.get_mut(&window)
                     && let Some(winit_window) = winit_windows.get_window(window)
                 {
-                    adapter.process_event(winit_window, &event);
+                    // `WindowWrapper<Box<dyn Window>>` -> `&dyn Window`.
+                    adapter.process_event(&***winit_window, &event);
                 }
 
                 match event {
-                    WindowEvent::Resized(size) => self
+                    WindowEvent::SurfaceResized(size) => self
                         .bevy_window_events
                         .send(react_to_resize(window, &mut win, size)),
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -281,7 +324,10 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                         }
                         self.bevy_window_events.send(keyboard_input);
                     }
-                    WindowEvent::CursorMoved { position, .. } => {
+                    // winit 0.31 unified mouse/touch/tablet input under `Pointer*` events.
+                    WindowEvent::PointerMoved {
+                        position, source, ..
+                    } => {
                         let physical_position = DVec2::new(position.x, position.y);
 
                         let last_position = win.physical_cursor_position();
@@ -292,25 +338,115 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                         win.set_physical_cursor_position(Some(physical_position));
                         let position =
                             (physical_position / win.resolution.scale_factor() as f64).as_vec2();
+
+                        // A `PointerSource::Touch` move is also a touch `Moved` event.
+                        if let event::PointerSource::Touch { finger_id, force } = &source {
+                            let location = position.as_dvec2();
+                            self.bevy_window_events
+                                .send(converters::convert_touch_input(
+                                    BevyTouchPhase::Moved,
+                                    winit::dpi::LogicalPosition::new(location.x, location.y),
+                                    *force,
+                                    *finger_id,
+                                    window,
+                                ));
+                        }
+
                         self.bevy_window_events.send(CursorMoved {
                             window,
                             position,
                             delta,
+                            kind: converters::convert_pointer_source(&source),
                         });
                     }
-                    WindowEvent::CursorEntered { .. } => {
-                        self.bevy_window_events.send(CursorEntered { window });
-                    }
-                    WindowEvent::CursorLeft { .. } => {
-                        win.set_physical_cursor_position(None);
-                        self.bevy_window_events.send(CursorLeft { window });
-                    }
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        self.bevy_window_events.send(MouseButtonInput {
-                            button: converters::convert_mouse_button(button),
-                            state: converters::convert_element_state(state),
+                    WindowEvent::PointerEntered { kind, .. } => {
+                        self.bevy_window_events.send(CursorEntered {
                             window,
+                            kind: converters::convert_pointer_kind(kind),
                         });
+                    }
+                    WindowEvent::PointerLeft { kind, position, .. } => {
+                        // A touch pointer leaving the window without an accompanying button
+                        // release means the system canceled tracking; surface it as a
+                        // canceled touch. winit reports the finger id directly on the
+                        // `PointerKind`, and a last-known position where available.
+                        if let event::PointerKind::Touch(finger_id) = kind {
+                            let last_position = position
+                                .or_else(|| {
+                                    win.physical_cursor_position().map(|p| {
+                                        winit::dpi::PhysicalPosition::new(p.x as f64, p.y as f64)
+                                    })
+                                })
+                                .unwrap_or(winit::dpi::PhysicalPosition::new(0.0, 0.0));
+                            let location =
+                                last_position.to_logical(win.resolution.scale_factor() as f64);
+                            self.bevy_window_events
+                                .send(converters::convert_touch_input(
+                                    BevyTouchPhase::Canceled,
+                                    location,
+                                    None,
+                                    finger_id,
+                                    window,
+                                ));
+                        }
+                        win.set_physical_cursor_position(None);
+                        self.bevy_window_events.send(CursorLeft {
+                            window,
+                            kind: converters::convert_pointer_kind(kind),
+                        });
+                    }
+                    WindowEvent::PointerButton {
+                        state,
+                        position,
+                        button,
+                        ..
+                    } => {
+                        // The button event carries its own position, and on touch
+                        // platforms a gesture can begin (and a tap complete) without any
+                        // `PointerMoved` — the tracked cursor position may be stale from
+                        // the previous gesture. Surface the button's position as a
+                        // `CursorMoved` first so consumers always see the press/release
+                        // location. `delta` is `None` because the jump from the previous
+                        // gesture is not real motion.
+                        let physical_position = DVec2::new(position.x, position.y);
+                        if win.physical_cursor_position() != Some(physical_position.as_vec2()) {
+                            win.set_physical_cursor_position(Some(physical_position));
+                            self.bevy_window_events.send(CursorMoved {
+                                window,
+                                position: (physical_position
+                                    / win.resolution.scale_factor() as f64)
+                                    .as_vec2(),
+                                delta: None,
+                                kind: converters::convert_button_source(&button),
+                            });
+                        }
+
+                        // A touch button press/release maps to a touch `Started`/`Ended`.
+                        if let event::ButtonSource::Touch { finger_id, force } = &button {
+                            let phase = if state.is_pressed() {
+                                BevyTouchPhase::Started
+                            } else {
+                                BevyTouchPhase::Ended
+                            };
+                            let location =
+                                position.to_logical(win.resolution.scale_factor() as f64);
+                            self.bevy_window_events
+                                .send(converters::convert_touch_input(
+                                    phase, location, *force, *finger_id, window,
+                                ));
+                        }
+
+                        // `ButtonSource::mouse_button` maps every pointer kind (mouse,
+                        // touch, tablet) to an equivalent `MouseButton` for generic
+                        // mouse-input handling.
+                        if let Some(mouse_button) = button.clone().mouse_button() {
+                            self.bevy_window_events.send(MouseButtonInput {
+                                button: converters::convert_mouse_button(mouse_button),
+                                state: converters::convert_element_state(state),
+                                window,
+                                kind: converters::convert_button_source(&button),
+                            });
+                        }
                     }
                     WindowEvent::PinchGesture { delta, .. } => {
                         self.bevy_window_events.send(PinchGesture(delta as f32));
@@ -350,13 +486,6 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                             }
                         }
                     }
-                    WindowEvent::Touch(touch) => {
-                        let location = touch
-                            .location
-                            .to_logical(win.resolution.scale_factor() as f64);
-                        self.bevy_window_events
-                            .send(converters::convert_touch_input(touch, location, window));
-                    }
                     WindowEvent::Focused(focused) => {
                         win.focused = focused;
                         self.bevy_window_events
@@ -366,15 +495,21 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                         self.bevy_window_events
                             .send(WindowOccluded { window, occluded });
                     }
-                    WindowEvent::DroppedFile(path_buf) => {
-                        self.bevy_window_events
-                            .send(FileDragAndDrop::DroppedFile { window, path_buf });
+                    // winit 0.31 replaced the per-file `DroppedFile`/`HoveredFile` events
+                    // with batched `Drag*` events carrying a `Vec<PathBuf>`.
+                    WindowEvent::DragDropped { paths, .. } => {
+                        for path_buf in paths {
+                            self.bevy_window_events
+                                .send(FileDragAndDrop::DroppedFile { window, path_buf });
+                        }
                     }
-                    WindowEvent::HoveredFile(path_buf) => {
-                        self.bevy_window_events
-                            .send(FileDragAndDrop::HoveredFile { window, path_buf });
+                    WindowEvent::DragEntered { paths, .. } => {
+                        for path_buf in paths {
+                            self.bevy_window_events
+                                .send(FileDragAndDrop::HoveredFile { window, path_buf });
+                        }
                     }
-                    WindowEvent::HoveredFileCancelled => {
+                    WindowEvent::DragLeft { .. } => {
                         self.bevy_window_events
                             .send(FileDragAndDrop::HoveredFileCanceled { window });
                     }
@@ -401,6 +536,9 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
                         event::Ime::Disabled => {
                             self.bevy_window_events.send(Ime::Disabled { window });
                         }
+                        // winit 0.31 added `DeleteSurrounding` for IME surrounding-text
+                        // edits. Bevy's `Ime` event has no equivalent, so it is ignored.
+                        event::Ime::DeleteSurrounding { .. } => {}
                     },
                     WindowEvent::ThemeChanged(theme) => {
                         self.bevy_window_events.send(WindowThemeChanged {
@@ -443,19 +581,20 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
 
     fn device_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
-        _device_id: DeviceId,
+        _event_loop: &dyn ActiveEventLoop,
+        _device_id: Option<DeviceId>,
         event: DeviceEvent,
     ) {
         self.device_event_received = true;
 
-        if let DeviceEvent::MouseMotion { delta: (x, y) } = event {
+        // winit 0.31 renamed the raw motion device event to `PointerMotion`.
+        if let DeviceEvent::PointerMotion { delta: (x, y) } = event {
             let delta = Vec2::new(x as f32, y as f32);
             self.bevy_window_events.send(MouseMotion { delta });
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let mut create_monitor = SystemState::<CreateMonitorParams>::from_world(self.world_mut());
         create_monitors(
             event_loop,
@@ -493,24 +632,29 @@ impl ApplicationHandler<WinitUserEvent> for WinitAppRunnerState {
         }
     }
 
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+    fn suspended(&mut self, _event_loop: &dyn ActiveEventLoop) {
         // Mark the state as `WillSuspend`. This will let the schedule run one last time
         // before actually suspending to let the application react
         self.lifecycle = AppLifecycle::WillSuspend;
     }
+}
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drop windows while event loop is still active, before TLS destruction.
-        // Prevents panic on macOS when exiting from exclusive fullscreen.
+impl Drop for WinitAppRunnerState {
+    fn drop(&mut self) {
+        // winit 0.31 removed the `exiting` lifecycle callback. The cleanup that used to
+        // run there now happens when the runner state is dropped, which in practice
+        // happens inside `run_app`'s exit sequence (before it returns).
+        //
+        // Drop windows while the event loop is still active, before TLS destruction.
+        // Prevents a panic on macOS when exiting from exclusive fullscreen.
         WINIT_WINDOWS.with(|ww| ww.borrow_mut().windows.clear());
 
-        let world = self.world_mut();
-        world.clear_all();
+        self.app.world_mut().clear_all();
     }
 }
 
 impl WinitAppRunnerState {
-    fn redraw_requested(&mut self, event_loop: &ActiveEventLoop) {
+    fn redraw_requested(&mut self, event_loop: &dyn ActiveEventLoop) {
         let mut redraw_message_cursor = MessageCursor::<RequestRedraw>::default();
         let mut close_message_cursor = MessageCursor::<WindowCloseRequested>::default();
 
@@ -733,7 +877,11 @@ impl WinitAppRunnerState {
         }
 
         if let Some(app_exit) = self.app.should_exit() {
-            self.app_exit = Some(app_exit);
+            self.app_exit = Some(app_exit.clone());
+            // Publish the exit code so `winit_runner` can return it after `run_app`.
+            if let Some(slot) = &self.app_exit_slot {
+                *slot.lock().unwrap() = Some(app_exit);
+            }
 
             event_loop.exit();
         }
@@ -882,29 +1030,39 @@ impl WinitAppRunnerState {
 ///
 /// Overriding the app's [runner](bevy_app::App::runner) while using `WinitPlugin` will bypass the
 /// `EventLoop`.
-pub fn winit_runner(mut app: App, event_loop: EventLoop<WinitUserEvent>) -> AppExit {
+pub fn winit_runner(
+    mut app: App,
+    event_loop: EventLoop,
+    user_event_receiver: Receiver<WinitUserEvent>,
+) -> AppExit {
     if app.plugins_state() == PluginsState::Ready {
         app.finish();
         app.cleanup();
     }
 
-    let runner_state = WinitAppRunnerState::new(app);
+    let runner_state = WinitAppRunnerState::new(app, user_event_receiver);
 
     trace!("starting winit event loop");
     // The winit docs mention using `spawn` instead of `run` on Wasm.
-    // https://docs.rs/winit/latest/winit/platform/web/trait.EventLoopExtWebSys.html#tymethod.spawn_app
-    cfg_select! {
-        target_arch = "wasm32" => {
+    // https://docs.rs/winit/latest/winit/platform/web/trait.EventLoopExtWeb.html
+    //
+    // winit 0.31's `run_app` takes the handler by value and requires it to be `'static`,
+    // and the `exiting` callback was removed, so the app-exit code is read out of a shared
+    // cell that the runner writes to before `event_loop.exit()`.
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
             event_loop.spawn_app(runner_state);
             AppExit::Success
-        }
-        _ => {
+        } else {
+            let app_exit = Arc::new(Mutex::new(None));
             let mut runner_state = runner_state;
-            if let Err(err) = event_loop.run_app(&mut runner_state) {
+            runner_state.app_exit_slot = Some(Arc::clone(&app_exit));
+            if let Err(err) = event_loop.run_app(runner_state) {
                 bevy_log::error!("winit event loop returned an error: {err}");
             }
             // If everything is working correctly then the event loop only exits after it's sent an exit code.
-            runner_state.app_exit.unwrap_or_else(|| {
+            let exit = app_exit.lock().unwrap().take();
+            exit.unwrap_or_else(|| {
                 bevy_log::error!("Failed to receive an app exit code! This is a bug");
                 AppExit::error()
             })

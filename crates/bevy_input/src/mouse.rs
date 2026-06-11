@@ -1,6 +1,6 @@
 //! The mouse input functionality.
 
-use crate::{touch::TouchPhase, ButtonInput, ButtonState};
+use crate::{pointer::PointerKind, touch::TouchPhase, ButtonInput, ButtonState};
 #[cfg(feature = "bevy_reflect")]
 use bevy_ecs::prelude::ReflectMessage;
 use bevy_ecs::{
@@ -28,7 +28,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 ///
 /// The event is read inside of the [`mouse_button_input_system`]
 /// to update the [`ButtonInput<MouseButton>`] resource.
-#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Message, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -46,6 +46,8 @@ pub struct MouseButtonInput {
     pub state: ButtonState,
     /// Window that received the input.
     pub window: Entity,
+    /// The kind of device that produced this event.
+    pub kind: PointerKind,
 }
 
 /// A button on a mouse device.

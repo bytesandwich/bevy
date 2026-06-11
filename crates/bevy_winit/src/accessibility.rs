@@ -131,8 +131,8 @@ impl DeactivationHandler for WinitDeactivationHandler {
 
 /// Prepares accessibility for a winit window.
 pub(crate) fn prepare_accessibility_for_window(
-    event_loop: &ActiveEventLoop,
-    winit_window: &winit::window::Window,
+    event_loop: &dyn ActiveEventLoop,
+    winit_window: &dyn winit::window::Window,
     entity: Entity,
     name: String,
     accessibility_requested: AccessibilityRequested,

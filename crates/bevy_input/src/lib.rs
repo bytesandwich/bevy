@@ -22,6 +22,9 @@ mod button_input;
 /// Common run conditions
 pub mod common_conditions;
 
+/// Pointer device kinds and tablet-tool data.
+pub mod pointer;
+
 #[cfg(feature = "gamepad")]
 pub mod gamepad;
 
@@ -59,6 +62,9 @@ pub mod prelude {
     #[doc(hidden)]
     #[cfg(feature = "mouse")]
     pub use crate::mouse::MouseButton;
+
+    #[doc(hidden)]
+    pub use crate::pointer::{PointerKind, TabletToolKind};
 
     #[doc(hidden)]
     #[cfg(feature = "touch")]
